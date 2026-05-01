@@ -80,6 +80,24 @@ Run:
 docker run --rm -p 5000:5000 sign-language-recognition
 ```
 
+## Deploy on Render
+
+This project includes [render.yaml](render.yaml) for Render Blueprint deployment.
+
+Important behavior on cloud hosting:
+
+- Server-side webcam capture is not available on Render.
+- The app now supports browser camera mode and sends frames to `/predict` for inference.
+- That means live feed works from the user's own camera in the browser after deployment.
+
+Steps:
+
+1. Push this repository to GitHub.
+2. In Render, create a new Blueprint and select this repository.
+3. Set the environment variable `GROQ_API_KEY` in Render.
+4. Deploy the service.
+5. Open the Render URL and allow camera access in the browser.
+
 ## Performance tips
 
 - Prefer the exported TFLite model for deployment.

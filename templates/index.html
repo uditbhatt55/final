@@ -236,7 +236,8 @@ body{background:linear-gradient(270deg,#FFF7CC 0%, #F9FFF4 50%, #E8FFF0 100%);ba
           <div style="font-size:11px;color:var(--text-soft);font-family:var(--mono)">CAM·01 · 720p</div>
         </div>
         <div class="vw">
-          <img class="vf" src="{{ url_for('video_feed') }}" alt="Webcam"/>
+          <img id="serverFeed" class="vf" src="{{ url_for('video_feed') }}" alt="Server webcam feed"/>
+          <video id="localCam" class="vf" autoplay playsinline muted style="display:none"></video>
           <div class="vo">
             <div class="vig"></div>
             <div class="cm tl"></div><div class="cm tr"></div>
@@ -246,7 +247,16 @@ body{background:linear-gradient(270deg,#FFF7CC 0%, #F9FFF4 50%, #E8FFF0 100%);ba
         </div>
         <div class="vfoot">
           <div class="vfl">Camera ready</div>
-          <div class="fpst" id="fps">— fps</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <button class="ba" id="camBtn" style="padding:6px 12px;font-size:11px">Enable Camera</button>
+            <label style="display:flex;align-items:center;gap:6px;margin-left:8px;font-size:12px;color:var(--text-soft)">
+              <input type="checkbox" id="ttaToggle" style="margin-right:6px">TTA
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;margin-left:6px;font-size:12px;color:var(--text-soft)">
+              <input type="checkbox" id="debugToggle" style="margin-right:6px">Debug
+            </label>
+            <div class="fpst" id="fps">— fps</div>
+          </div>
         </div>
       </div>
 
@@ -276,6 +286,7 @@ body{background:linear-gradient(270deg,#FFF7CC 0%, #F9FFF4 50%, #E8FFF0 100%);ba
             <button class="ba bspeak" onclick="doSpeak()">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>Speak
             </button>
+            <button class="ba" id="reportBtn" style="background:#ffd6d6;border-color:rgba(232,128,128,.25);color:#7a2b2b" onclick="reportMisclassification()">Report Misclassification</button>
           </div>
         </div>
       </div>
@@ -314,6 +325,11 @@ body{background:linear-gradient(270deg,#FFF7CC 0%, #F9FFF4 50%, #E8FFF0 100%);ba
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 const socket = io();
+const appState = {
+  localCamMode: false,
+  predictBusy: false,
+  captureTimer: null,
+};
 const ui = {
   ot: document.getElementById('ot'),
   od: document.getElementById('od'),
@@ -327,8 +343,105 @@ const ui = {
   chips: document.getElementById('chips'),
   cms: document.getElementById('cms'),
   cinp: document.getElementById('cinp'),
-  sendBtn: document.querySelector('.csend')
+  sendBtn: document.querySelector('.csend'),
+  camBtn: document.getElementById('camBtn')
 };
+
+const serverFeed = document.getElementById('serverFeed');
+const localCam = document.getElementById('localCam');
+const captureCanvas = document.createElement('canvas');
+
+async function startLocalCameraMode(){
+  if(appState.localCamMode) return;
+  if(!window.isSecureContext){
+    showToast('Camera needs HTTPS secure context');
+    return;
+  }
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showToast('Browser camera API unavailable');
+    return;
+  }
+
+  ui.camBtn.disabled = true;
+  ui.camBtn.textContent = 'Starting...';
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    localCam.srcObject = stream;
+    await localCam.play();
+    appState.localCamMode = true;
+    serverFeed.style.display = 'none';
+    localCam.style.display = 'block';
+    document.querySelector('.vfl').textContent = 'Browser camera ready';
+    ui.camBtn.textContent = 'Camera On';
+    showToast('Using browser camera mode');
+    if (appState.captureTimer) clearInterval(appState.captureTimer);
+    appState.captureTimer = setInterval(captureAndPredict, 260);
+  } catch (err) {
+    appState.localCamMode = false;
+    ui.camBtn.disabled = false;
+    ui.camBtn.textContent = 'Enable Camera';
+    const msg = err && err.name ? `Camera blocked: ${err.name}` : 'Camera permission denied';
+    showToast(msg);
+  }
+}
+
+async function captureAndPredict(){
+  if(!appState.localCamMode || appState.predictBusy) return;
+  if(localCam.readyState < 2) return;
+
+  appState.predictBusy = true;
+  try{
+    captureCanvas.width = localCam.videoWidth || 640;
+    captureCanvas.height = localCam.videoHeight || 480;
+    const ctx = captureCanvas.getContext('2d');
+    ctx.drawImage(localCam, 0, 0, captureCanvas.width, captureCanvas.height);
+
+    const frameBlob = await new Promise((resolve) => {
+      captureCanvas.toBlob(resolve, 'image/jpeg', 0.82);
+    });
+    // store last captured frame for reporting
+    appState.lastFrameBlob = frameBlob;
+    if(!frameBlob) return;
+
+    const formData = new FormData();
+    formData.append('image', frameBlob, 'frame.jpg');
+
+    // include debug/tta query params when toggles are set
+    const debugOn = document.getElementById('debugToggle') && document.getElementById('debugToggle').checked;
+    const ttaOn = document.getElementById('ttaToggle') && document.getElementById('ttaToggle').checked;
+    const url = '/predict' + (debugOn || ttaOn ? '?' + new URLSearchParams({ debug: debugOn ? '1' : '0', tta: ttaOn ? '1' : '0' }) : '');
+    const res = await fetch(url, { method: 'POST', body: formData });
+    if(!res.ok) return;
+    const payload = await res.json();
+    const parsed = parsePredictionPayload(payload);
+    if(!parsed) return;
+
+    const { sign, conf } = parsed;
+    schedulePredictionRender({ sign, conf });
+    updateSentence(sign, conf);
+    speak(sign);
+
+    total++;
+    csum += conf;
+    ui.ss.textContent = total;
+    ui.sc.textContent = Math.round(csum / total) + '%';
+
+    fc++;
+    const now = Date.now();
+    if (now - fl >= 1000) {
+      ui.fps.textContent = fc + ' fps';
+      fc = 0;
+      fl = now;
+    }
+  } catch (e) {
+    console.warn('predict loop error', e);
+  } finally {
+    appState.predictBusy = false;
+  }
+}
 
 function countFingers(lm){
   const tips = [8,12,16,20];
@@ -450,6 +563,7 @@ function schedulePredictionRender(payload){
 }
 
 socket.on('prediction', (d) => {
+  if (appState.localCamMode) return;
   try {
     const parsed = parsePredictionPayload(d);
     if (!parsed) return;
@@ -590,13 +704,30 @@ function sendMsg(){
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: v })
   })
-  .then(res => res.ok ? res.json() : Promise.reject(new Error('chat request failed')))
+  .then(async (res) => {
+    let data = null;
+    try {
+      data = await res.json();
+    } catch (_e) {
+      data = null;
+    }
+
+    if (!res.ok) {
+      const msg = data && typeof data.reply === 'string' && data.reply.trim()
+        ? data.reply.trim()
+        : `Chat request failed (${res.status})`;
+      throw new Error(msg);
+    }
+
+    return data || {};
+  })
   .then(data => {
     const replyText = data && typeof data.reply === 'string' ? data.reply.trim() : '';
     apMsg('ai','🌸', replyText || 'No response available.');
   })
-  .catch(() => {
-    apMsg('ai','🌸', 'AI error');
+  .catch((err) => {
+    const msg = err && err.message ? err.message : 'AI error';
+    apMsg('ai','🌸', msg);
   })
   .finally(() => {
     setTyping(false);
@@ -622,6 +753,31 @@ function showToast(msg){
   document.getElementById('ttxt').textContent=msg;
   t.classList.add('show');clearTimeout(tt);
   tt=setTimeout(()=>t.classList.remove('show'),2800);
+}
+
+ui.camBtn.addEventListener('click', startLocalCameraMode);
+
+startLocalCameraMode();
+
+async function reportMisclassification(){
+  if(!appState.lastFrameBlob){ showToast('No recent frame to report'); return; }
+  const correct = prompt('Enter correct label for this frame (optional):', lastDisplayedSign || '');
+  const fd = new FormData();
+  fd.append('image', appState.lastFrameBlob, 'reported.jpg');
+  if(correct) fd.append('correct_label', correct);
+
+  try{
+    const res = await fetch('/collect_misclassified', { method: 'POST', body: fd });
+    if(res.ok){
+      const j = await res.json();
+      showToast('Saved for retraining: ' + (j.saved || 'ok'));
+    } else {
+      showToast('Report failed: ' + res.status);
+    }
+  } catch(e){
+    console.warn('report error', e);
+    showToast('Report failed');
+  }
 }
 </script>
 </body>
