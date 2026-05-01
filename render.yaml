@@ -1,10 +1,11 @@
 services:
   - type: web
     name: sign-language-ai
-    env: python
+    env: docker
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    # Using Docker runtime - Render will build the Dockerfile at repo root
+    buildCommand: docker build -t sign-language-ai:latest .
+    startCommand: docker run -p $PORT:5000 sign-language-ai:latest
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.3
