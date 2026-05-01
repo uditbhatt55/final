@@ -81,8 +81,36 @@ class RealTimePredictor:
         self.threshold = float(threshold)
         self.tta_enabled = bool(tta_enabled)
 
-        # Load model once (no compilation required for inference)
-        self.model = tf.keras.models.load_model(str(model_path), compile=False)
+        # Prefer a TFLite interpreter if a .tflite model exists alongside the Keras model.
+        self.interpreter = None
+        tflite_candidate = None
+        try:
+            mpath = Path(model_path)
+            # common tflite names
+            for cand in [mpath.with_suffix('.tflite'), Path('artifacts') / 'sign_language_cnn.tflite', Path('artifacts') / 'model.tflite']:
+                if cand.exists():
+                    tflite_candidate = cand
+                    break
+        except Exception:
+            tflite_candidate = None
+
+        if tflite_candidate is not None:
+            try:
+                self.interpreter = tf.lite.Interpreter(model_path=str(tflite_candidate))
+                self.interpreter.allocate_tensors()
+                self.input_details = self.interpreter.get_input_details()
+                self.output_details = self.interpreter.get_output_details()
+                self.model = None
+                logger.info('Loaded TFLite interpreter: %s', tflite_candidate)
+            except Exception:
+                logger.exception('Failed to load TFLite interpreter, falling back to Keras model')
+                self.interpreter = None
+
+        if self.interpreter is None:
+            # Load Keras model once (no compilation required for inference)
+            self.model = tf.keras.models.load_model(str(model_path), compile=False)
+            self.input_details = None
+            self.output_details = None
 
         # Load labels
         lm = Path(label_map_path)
@@ -120,6 +148,32 @@ class RealTimePredictor:
     def _predict_probs(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Return raw probability vector for a single frame (no smoothing)."""
         inp = self._preprocess(frame_bgr)
+        # If using TFLite interpreter, set tensor and invoke
+        if self.interpreter is not None:
+            # TFLite input may expect uint8 or float32 depending on model
+            # Resize/convert if needed by input_details
+            try:
+                tensor_index = self.input_details[0]['index']
+                # handle quantized inputs
+                if self.input_details[0]['dtype'] == np.uint8:
+                    # scale from float [0,255] to uint8
+                    in_scale, in_zero_point = self.input_details[0].get('quantization', (1.0, 0.0))
+                    arr = np.clip(inp, 0, 255).astype(np.uint8)
+                else:
+                    arr = inp.astype(self.input_details[0]['dtype'])
+
+                self.interpreter.set_tensor(tensor_index, arr)
+                self.interpreter.invoke()
+                out = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
+                # if output is quantized, dequantize
+                if self.output_details[0].get('dtype') == np.uint8:
+                    scale, zero_point = self.output_details[0].get('quantization', (1.0, 0))
+                    out = (out.astype(np.float32) - zero_point) * scale
+                return out
+            except Exception:
+                logger.exception('TFLite inference failed; falling back to Keras')
+
+        # fallback to Keras model
         try:
             outputs = self.model(inp, training=False).numpy()
         except Exception:
